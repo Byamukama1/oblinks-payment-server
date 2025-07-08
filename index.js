@@ -16,14 +16,8 @@ const cors = require('cors'); // ADDED: CORS middleware
 const app = express();
 
 // ADDED: Enable CORS for frontend domain
-app.use(cors({
-  origin: [
-    'https://onlinemarket-ug.com',
-    'https://www.onlinemarket-ug.com'
-  ],
-  methods: ['GET', 'POST']
-}));
-
+// Enable CORS for all origins (for development)
+app.use(cors());
 app.use(bodyParser.json());
 
 // Load Firebase Admin SDK
