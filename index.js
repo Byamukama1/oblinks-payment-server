@@ -4,7 +4,7 @@
  *  - Withdrawals Automation
  *  - Collections (Customer Payments)
  *  - Business Listing Automation
- *******************************************/
+ ******************************************/
 
 require('dotenv').config();
 const express = require('express');
