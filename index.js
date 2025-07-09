@@ -74,7 +74,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
       encryption_key: process.env.ENCRYPTION_KEY,
       amount: withdrawal.amount,
       emailAddress: 'byamukamambabazimentor@gmail.com',
-      call_back: 'https://oblinks-payout-automation.byamukamambabaz.repl.co/ipn',
+   call_back: 'https://oblinks-payment-server.onrender.com/ipn',
       phone: withdrawal.account,
       reason: 'User Withdrawal',
       debit_wallet: 'UGX WALLET'
