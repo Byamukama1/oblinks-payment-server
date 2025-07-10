@@ -319,6 +319,75 @@ app.post('/ipn', async (req, res) => {
 });
 
 /*******************************************
+ * NEW: Single Withdrawal Processing
+ *******************************************/
+app.post('/process-single-withdrawal', async (req, res) => {
+  try {
+    // Validate request
+    const { withdrawalId } = req.body;
+    if (!withdrawalId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing withdrawalId in request body'
+      });
+    }
+
+    // Fetch withdrawal document
+    const withdrawalRef = db.collection('withdrawals').doc(withdrawalId);
+    const doc = await withdrawalRef.get();
+    
+    if (!doc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: `Withdrawal ${withdrawalId} not found`
+      });
+    }
+
+    const withdrawalData = doc.data();
+    
+    // Validate withdrawal status
+    if (withdrawalData.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: `Withdrawal ${withdrawalId} is already processed (current status: ${withdrawalData.status})`
+      });
+    }
+
+    // Generate SiliconPay token
+    const token = await generateToken();
+    
+    // Process withdrawal
+    console.log(`⚡ Processing single withdrawal: ${withdrawalId}`);
+    await sendPayout(withdrawalId, withdrawalData, token);
+    
+    // Verify final status
+    const updatedDoc = await withdrawalRef.get();
+    const updatedStatus = updatedDoc.data().status;
+    
+    if (updatedStatus === 'approved') {
+      return res.json({
+        success: true,
+        message: `Successfully processed withdrawal ${withdrawalId}`,
+        data: updatedDoc.data()
+      });
+    } else {
+      return res.status(500).json({
+        success: false,
+        error: `Withdrawal ${withdrawalId} processing failed (final status: ${updatedStatus})`
+      });
+    }
+    
+  } catch (error) {
+    console.error(`❌ Critical error processing single withdrawal:`, error.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+/*******************************************
  * Start Express Server
  *******************************************/
 const PORT = process.env.PORT || 3000;
