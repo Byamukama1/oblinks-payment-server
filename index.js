@@ -1,5 +1,5 @@
 /******************************************
- * OBlinks Payments Server (Render-Ready v3)
+ * OBlinks Payments Server (Render-Ready v4)
  ******************************************/
 
 require("dotenv").config();
@@ -81,6 +81,9 @@ function aes256EcbBase64(plainText, secretKeyUtf8) {
   return enc.toString("base64");
 }
 
+// keep only digits (remove +, spaces)
+const digitsOnly = s => String(s || "").replace(/\D+/g, "");
+
 /* ------------------------- SiliconPay: Token ------------------------- */
 async function generateToken() {
   const secrete_hash = crypto.createHash("sha512").update(process.env.SECRET_KEY).digest("hex");
@@ -99,9 +102,8 @@ async function generateToken() {
 async function sendPayout(withdrawalId, withdrawal, token) {
   const encryptionKey = String(process.env.ENCRYPTION_KEY || "");
   const secretKey = String(process.env.SECRET_KEY || "");
-  const phone = String(withdrawal.account || "").trim();
 
-  // amount must be a plain integer string
+  const phone = digitsOnly(withdrawal.account);
   const intAmount = Math.max(0, parseInt(String(withdrawal.amount), 10));
   if (!phone || !intAmount) {
     console.error("❌ Invalid withdrawal payload:", { phone, amount: withdrawal.amount });
@@ -116,20 +118,23 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   const msg = crypto.createHash("sha256").update(encryptionKey).digest("hex") + phone;
   const signature = crypto.createHmac("sha256", secretKey).update(msg).digest("hex");
 
+  // Debit wallet per support: "UGX" (configurable)
+  const DEBIT_WALLET = process.env.DEBIT_WALLET || "UGX";
+
   const payload = {
     req: "mm",
     currency: "UGX",
     txRef: `TX-${Date.now()}`,
     encryption_key: encryptionKey,
-    amount: String(intAmount), // << plain integer string
+    amount: String(intAmount), // plain integer string
     emailAddress: withdrawal.emailAddress || "byamukamambabazimentor@gmail.com",
     call_back: process.env.IPN_URL,
     phone,
     reason: withdrawal.reason || "User Withdrawal",
-    debit_wallet: "UGX WALLET",
+    debit_wallet: DEBIT_WALLET, // <- "UGX"
   };
 
-  // Include same headers as token (some tenants require this) + signature
+  // Include token-style headers too
   const secrete_hash = crypto.createHash("sha512").update(secretKey).digest("hex");
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -141,7 +146,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
 
   try {
     console.log("➡️ SiliconPay Withdraw Request:", {
-      txRef: payload.txRef, phone: payload.phone, amount: payload.amount, currency: payload.currency
+      txRef: payload.txRef, phone: payload.phone, amount: payload.amount, debit_wallet: payload.debit_wallet
     });
 
     const { data, status } = await axios.post(process.env.SILICON_PAY_URL, payload, { headers });
@@ -185,7 +190,6 @@ async function sendPayout(withdrawalId, withdrawal, token) {
 
 /* ------------------------- Routes ----------------------------------- */
 app.get("/", (_req, res) => res.send("OBlinks Payment Server ✅"));
-
 app.get("/wakeup", (_req, res) => res.send("awake"));
 
 app.get(
@@ -208,6 +212,7 @@ app.post(
   asyncRoute(async (req, res) => {
     const { withdrawalId } = req.body || {};
     if (!withdrawalId) return res.status(400).json({ success: false, error: "Missing withdrawalId" });
+
     const ref = db.collection("withdrawals").doc(withdrawalId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, error: "Withdrawal not found" });
@@ -241,7 +246,7 @@ app.post(
     const payload = {
       req: "mobile_money",
       currency: "UGX",
-      phone: String(phone).trim(),
+      phone: digitsOnly(phone),
       encryption_key: process.env.ENCRYPTION_KEY,
       amount: String(Math.max(0, parseInt(String(amount), 10))), // integer string
       emailAddress: email,
