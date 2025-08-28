@@ -1,23 +1,23 @@
 {
-  "name": "nodejs",
+  "name": "oblinks-payment-server",
   "version": "1.0.0",
-  "description": "",
+  "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@types/node": "^22.13.11",
-    "axios": "^1.10.0",
-    "body-parser": "^2.2.0",
+    "axios": "^1.7.7",
     "cors": "^2.8.5",
-    "dotenv": "^17.0.1",
-    "express": "^5.1.0",
-    "firebase-admin": "^13.4.0",
-    "nodemailer": "^6.9.8"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0",
+    "luxon": "^3.5.0",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.14"
   }
 }
