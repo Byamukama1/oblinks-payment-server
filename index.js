@@ -1,5 +1,5 @@
 /******************************************
- * OBlinks + MoneyGamez Server (Render v4)
+ * OBlinks + MoneyGamez Server (Render v5)
  *  - OBlinks: withdrawals, collections, business IPN
  *  - MoneyGamez: deposits via Silicon Pay, stakes, referrals, cron daily returns
  ******************************************/
@@ -73,7 +73,9 @@ function resolveServiceAccountPath() {
   if (process.env.FIREBASE_ADMIN_PATH) return process.env.FIREBASE_ADMIN_PATH;
   const dir = "/etc/secrets";
   try {
-    const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".json"));
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith(".json"));
     if (files.length) return path.join(dir, files[0]);
   } catch (_) {}
   return "/etc/secrets/firebase-admin.json";
@@ -86,7 +88,9 @@ function loadServiceAccount(p) {
   return parsed;
 }
 admin.initializeApp({
-  credential: admin.credential.cert(loadServiceAccount(resolveServiceAccountPath())),
+  credential: admin.credential.cert(
+    loadServiceAccount(resolveServiceAccountPath())
+  ),
 });
 const db = admin.firestore();
 
@@ -105,7 +109,7 @@ const digitsOnly = (s) => String(s || "").replace(/\D+/g, "");
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const todayKeyUTC = () => new Date().toISOString().slice(0, 10);
 const isSuccess = (s) =>
-  ["successful", "success", "completed", "approved", "paid", "successful"].includes(
+  ["successful", "success", "completed", "approved", "paid"].includes(
     String(s || "").toLowerCase()
   );
 
@@ -121,7 +125,10 @@ function aes256EcbBase64(plainText, secretKeyUtf8) {
 
 /* ─────────────── Silicon Pay helpers ─────────────── */
 async function siliconToken() {
-  const secrete_hash = crypto.createHash("sha512").update(process.env.SECRET_KEY).digest("hex");
+  const secrete_hash = crypto
+    .createHash("sha512")
+    .update(process.env.SECRET_KEY)
+    .digest("hex");
   const headers = {
     encryption_key: process.env.ENCRYPTION_KEY,
     secrete_hash,
@@ -142,28 +149,49 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   const amountInt = Math.max(0, parseInt(String(withdrawal.amount), 10));
 
   if (!phone || !amountInt) {
-    console.error("❌ Invalid withdrawal payload:", { phone, amount: withdrawal.amount });
+    console.error("❌ Invalid withdrawal payload:", {
+      phone,
+      amount: withdrawal.amount,
+    });
     await db.collection("withdrawals").doc(withdrawalId).update({
       status: "failed",
       errorMessage: "Invalid phone or amount",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     return;
   }
 
+  // Use a stable txRef tied to the doc so IPN can match it easily
+  const txRef = withdrawal.txRef || withdrawalId;
+
+  // Mark the doc as processing and store txRef BEFORE calling Silicon
+  await db
+    .collection("withdrawals")
+    .doc(withdrawalId)
+    .set(
+      {
+        txRef,
+        status: "processing",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
   // signature = HMAC_SHA256( SHA256(encryption_key)+phone , secret_key )
-  const msg = crypto.createHash("sha256").update(encryptionKey).digest("hex") + phone;
+  const msg =
+    crypto.createHash("sha256").update(encryptionKey).digest("hex") + phone;
   const signature = crypto.createHmac("sha256", secretKey).update(msg).digest("hex");
 
   const payload = {
     req: "mm",
     currency: "UGX",
-    txRef: `TX-${Date.now()}`,
+    txRef, // <— stable reference
     encryption_key: encryptionKey,
     amount: String(amountInt),
     emailAddress: withdrawal.emailAddress || "noreply@oblinks.app",
     call_back: process.env.IPN_URL,
     phone,
-    reason: withdrawal.reason || "User Withdrawal",
+    reason: withdrawal.reason || "Customer payment withdraw",
     debit_wallet: process.env.DEBIT_WALLET || "UGX",
   };
 
@@ -184,14 +212,23 @@ async function sendPayout(withdrawalId, withdrawal, token) {
       debit_wallet: payload.debit_wallet,
     });
 
-    const { data, status } = await axios.post(process.env.SILICON_PAY_URL, payload, { headers });
+    const { data, status } = await axios.post(
+      process.env.SILICON_PAY_URL,
+      payload,
+      { headers }
+    );
     console.log("✅ SiliconPay Withdraw Response:", status, data);
 
-    if (isSuccess(data?.status)) {
+    const msg = String(data?.message || "").toLowerCase();
+    const statusStr = String(data?.status || "").toLowerCase();
+
+    if (isSuccess(statusStr)) {
+      // Some accounts might return 'successful' immediately (rare)
       await db.collection("withdrawals").doc(withdrawalId).update({
         status: "approved",
         paidAt: admin.firestore.FieldValue.serverTimestamp(),
-        providerRef: data?.txRef || null,
+        providerRef: data?.txRef || txRef || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
       if (withdrawal.emailAddress) {
@@ -208,10 +245,19 @@ async function sendPayout(withdrawalId, withdrawal, token) {
               : console.log("✅ Email sent:", info.response)
         );
       }
+    } else if (msg.includes("transfer accepted") || Number(data?.code) === 200) {
+      // Normal happy path: queued; wait for IPN to flip to approved
+      await db.collection("withdrawals").doc(withdrawalId).update({
+        status: "processing",
+        providerRef: data?.txRef || txRef || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`⏳ Withdrawal ${withdrawalId} queued (processing)`);
     } else {
       await db.collection("withdrawals").doc(withdrawalId).update({
         status: "failed",
         errorMessage: data?.message || "Transfer rejected",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       console.log(`⚠️ Withdrawal ${withdrawalId} failed:`, data?.message);
     }
@@ -220,6 +266,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     await db.collection("withdrawals").doc(withdrawalId).update({
       status: "failed",
       errorMessage: err.response?.data?.message || err.message,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   }
 }
@@ -260,7 +307,10 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     let refRef = null;
     let refData = null;
     if (u.referrerCode) {
-      const refQuery = db.collection("users").where("referralCode", "==", u.referrerCode).limit(1);
+      const refQuery = db
+        .collection("users")
+        .where("referralCode", "==", u.referrerCode)
+        .limit(1);
       const refQSnap = await tx.get(refQuery);
       if (!refQSnap.empty) {
         refRef = refQSnap.docs[0].ref;
@@ -292,7 +342,9 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     });
 
     if (refRef) {
-      const paid = Array.isArray(refData.paidRefereesIds) ? refData.paidRefereesIds : [];
+      const paid = Array.isArray(refData.paidRefereesIds)
+        ? refData.paidRefereesIds
+        : [];
       if (!paid.includes(userId)) {
         const bonus = round2(amount * REFERRAL_BONUS_RATE);
         tx.update(refRef, {
@@ -319,7 +371,9 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     });
   });
 
-  console.log(`💰 Deposit processed: ${txRef} +${amount} UGX → stake created & totals updated`);
+  console.log(
+    `💰 Deposit processed: ${txRef} +${amount} UGX → stake created & totals updated`
+  );
 }
 
 /* ─────────────── Daily returns ─────────────── */
@@ -425,7 +479,10 @@ app.get(
   "/process-withdrawals",
   asyncRoute(async (_req, res) => {
     console.log("✅ Checking pending withdrawals…");
-    const snap = await db.collection("withdrawals").where("status", "==", "pending").get();
+    const snap = await db
+      .collection("withdrawals")
+      .where("status", "==", "pending")
+      .get();
     if (snap.empty) return res.send("No pending withdrawals found.");
     const token = await siliconToken();
     for (const doc of snap.docs) {
@@ -440,15 +497,26 @@ app.post(
   "/process-single-withdrawal",
   asyncRoute(async (req, res) => {
     const { withdrawalId } = req.body || {};
-    if (!withdrawalId) return res.status(400).json({ success: false, error: "Missing withdrawalId" });
+    if (!withdrawalId)
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing withdrawalId" });
 
     const ref = db.collection("withdrawals").doc(withdrawalId);
     const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ success: false, error: "Withdrawal not found" });
+    if (!snap.exists)
+      return res
+        .status(404)
+        .json({ success: false, error: "Withdrawal not found" });
 
     const data = snap.data();
     if (data.status !== "pending")
-      return res.status(400).json({ success: false, error: `Already processed (status: ${data.status})` });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: `Already processed (status: ${data.status})`,
+        });
 
     const token = await siliconToken();
     console.log(`⚡ Processing single withdrawal: ${withdrawalId}`);
@@ -456,10 +524,24 @@ app.post(
 
     const updated = await ref.get();
     const finalStatus = updated.data()?.status;
-    if (finalStatus === "approved")
-      return res.json({ success: true, message: "Withdrawal approved", data: updated.data() });
 
-    return res.status(500).json({ success: false, error: `Processing failed (status: ${finalStatus})` });
+    if (finalStatus === "approved")
+      return res.json({
+        success: true,
+        message: "Withdrawal approved",
+        data: updated.data(),
+      });
+
+    if (finalStatus === "processing")
+      return res.json({
+        success: true,
+        message: "Withdrawal queued (processing). Awaiting IPN.",
+        data: updated.data(),
+      });
+
+    return res
+      .status(500)
+      .json({ success: false, error: `Processing failed (status: ${finalStatus})` });
   })
 );
 
@@ -468,7 +550,8 @@ app.post(
   "/start-payment",
   asyncRoute(async (req, res) => {
     const { phone, amount, email, package: pack } = req.body || {};
-    if (!phone || !amount || !email || !pack) return res.status(400).json({ error: "Missing required fields" });
+    if (!phone || !amount || !email || !pack)
+      return res.status(400).json({ error: "Missing required fields" });
 
     const txRef = `TX-${Date.now()}`;
     const payload = {
@@ -483,7 +566,11 @@ app.post(
       metadata: { kind: "oblinks" },
     };
 
-    console.log("➡️ SiliconPay Collection Request (OBlinks):", { txRef, phone: payload.phone, amount: payload.amount });
+    console.log("➡️ SiliconPay Collection Request (OBlinks):", {
+      txRef,
+      phone: payload.phone,
+      amount: payload.amount,
+    });
     const { data } = await axios.post(SILICON_COLLECT_URL, payload, {
       headers: { "Content-Type": "application/json" },
     });
@@ -500,7 +587,11 @@ app.post(
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    res.json({ message: "Payment push sent; awaiting confirmation.", txRef, siliconResponse: data });
+    res.json({
+      message: "Payment push sent; awaiting confirmation.",
+      txRef,
+      siliconResponse: data,
+    });
   })
 );
 
@@ -516,13 +607,31 @@ app.post(
     const narrative = (req.body?.narrative || "Wallet deposit").toString().slice(0, 100);
 
     if (!Number.isFinite(amount) || amount <= 0)
-      return res.status(400).json({ success: false, messages: ["Invalid amount"], data: [] });
-    if (!phone) return res.status(400).json({ success: false, messages: ["Invalid phone"], data: [] });
-    if (!userId) return res.status(400).json({ success: false, messages: ["Missing userId"], data: [] });
-    if (!process.env.IPN_URL) return res.status(500).json({ success: false, messages: ["Server missing PUBLIC_URL/IPN_URL"], data: [] });
+      return res
+        .status(400)
+        .json({ success: false, messages: ["Invalid amount"], data: [] });
+    if (!phone)
+      return res
+        .status(400)
+        .json({ success: false, messages: ["Invalid phone"], data: [] });
+    if (!userId)
+      return res
+        .status(400)
+        .json({ success: false, messages: ["Missing userId"], data: [] });
+    if (!process.env.IPN_URL)
+      return res
+        .status(500)
+        .json({ success: false, messages: ["Server missing PUBLIC_URL/IPN_URL"], data: [] });
 
     const txRef = `PP-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-    payCache.set(txRef, { amount, contact: phone, narrative, userId, status: "initiated", createdAt: Date.now() });
+    payCache.set(txRef, {
+      amount,
+      contact: phone,
+      narrative,
+      userId,
+      status: "initiated",
+      createdAt: Date.now(),
+    });
 
     // Seed minimal deposit doc
     await db.collection("deposits").doc(txRef).set(
@@ -542,18 +651,23 @@ app.post(
       phone,
       encryption_key: process.env.ENCRYPTION_KEY,
       amount: String(Math.max(0, Math.trunc(amount))),
-      emailAddress: email,              // always include, per docs
+      emailAddress: email, // always include, per docs
       call_back: process.env.IPN_URL,
       txRef,
       metadata: { kind: "moneygamez", userId },
     };
 
-    console.log("➡️ SiliconPay Collection Request (MG):", { txRef, phone, amount: payload.amount });
+    console.log("➡️ SiliconPay Collection Request (MG):", {
+      txRef,
+      phone,
+      amount: payload.amount,
+    });
     const { data, status } = await axios.post(SILICON_COLLECT_URL, payload, {
       headers: { "Content-Type": "application/json" },
     });
 
-    if (!(status >= 200 && status < 300)) payCache.get(txRef).status = "failed_to_start";
+    if (!(status >= 200 && status < 300))
+      payCache.get(txRef).status = "failed_to_start";
     return res.status(status).json({ ...(data || {}), transaction_ref: txRef });
   })
 );
@@ -565,7 +679,7 @@ app.get("/api/pay/:ref", (req, res) => {
   res.json({ success: true, data: [{ transaction_reference: ref, ...rec }] });
 });
 
-/* ─────────────── Unified IPN (OBlinks + MoneyGamez) ─────────────── */
+/* ─────────────── Unified IPN (Withdrawals first, then Payments) ─────────────── */
 app.post(
   "/ipn",
   asyncRoute(async (req, res) => {
@@ -573,7 +687,7 @@ app.post(
     const { txRef, status, msisdn, secure_hash } = req.body || {};
     if (!txRef) return res.status(400).send("Missing txRef");
 
-    // Silicon docs show 'nework_ref' (typo) sometimes; also handle 'network_ref'
+    // Silicon docs sometimes use 'nework_ref' (typo); also handle 'network_ref'
     const networkRef = req.body?.nework_ref || req.body?.network_ref || null;
 
     // Validate signature if present
@@ -583,23 +697,50 @@ app.post(
       return res.status(403).send("Invalid signature");
     }
 
-    // Persist/merge payment record (OBlinks flow)
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const finalStatus = isSuccess(status) ? "approved" : "failed";
+
+    /* 1) Try to update a withdrawal (by id == txRef, else by txRef field) */
+    let wRef = db.collection("withdrawals").doc(txRef);
+    let wSnap = await wRef.get();
+    if (!wSnap.exists) {
+      const q = await db.collection("withdrawals").where("txRef", "==", txRef).limit(1).get();
+      if (!q.empty) {
+        wRef = q.docs[0].ref;
+        wSnap = q.docs[0];
+      }
+    }
+    if (wSnap.exists) {
+      await wRef.set(
+        {
+          status: finalStatus,
+          providerRef: networkRef || null,
+          msisdn: msisdn || null,
+          updatedAt: now,
+          ...(finalStatus === "approved" ? { paidAt: now } : { errorMessage: req.body?.message || null }),
+        },
+        { merge: true }
+      );
+      console.log(`✅ Withdrawal ${wRef.id} -> ${finalStatus}`);
+      return res.send("OK");
+    }
+
+    /* 2) Else treat as a collection payment (legacy/OBlinks/MoneyGamez) */
     const paymentRef = db.collection("payments").doc(txRef);
     await paymentRef.set(
       {
-        status: isSuccess(status) ? "approved" : "failed",
+        status: finalStatus,
         network_ref: networkRef,
         msisdn: msisdn || null,
         secure_hash: secure_hash || null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: now,
       },
       { merge: true }
     );
     console.log(`✅ Payment ${txRef} -> ${status}`);
 
     // MoneyGamez credit + stake creation on success (idempotent)
-    if (isSuccess(status)) {
-      // Discover amount & userId
+    if (finalStatus === "approved") {
       const rec = payCache.get(txRef) || {};
       let amount =
         Number(rec.amount) ||
@@ -612,55 +753,64 @@ app.post(
         if (depSnap.exists) userId = depSnap.data()?.userId || "";
       }
       if (userId && amount > 0) {
-        await createStakeAndCredit(txRef, amount, userId, rec.contact || msisdn || null, req.body);
+        await createStakeAndCredit(
+          txRef,
+          amount,
+          userId,
+          rec.contact || msisdn || null,
+          req.body
+        );
       } else {
         if (!userId) console.warn("No userId available for tx", txRef);
         if (!(amount > 0)) console.warn("No amount found for tx", txRef);
       }
-    }
 
-    // OBlinks business automation (only when an OBlinks payment doc carries email/package)
-    try {
-      const paySnap = await paymentRef.get();
-      const payData = paySnap.data() || {};
-      if (isSuccess(status) && payData.email && payData.package) {
-        const q = db
-          .collection("pendingBusinesses")
-          .where("paymentPhone", "==", payData.phone)
-          .where("package", "==", payData.package);
-        const snap = await q.get();
-        if (!snap.empty) {
-          for (const doc of snap.docs) {
-            const businessData = doc.data();
-            const businessId = doc.id;
+      // OBlinks business automation (only when an OBlinks payment doc carries email/package)
+      try {
+        const paySnap = await paymentRef.get();
+        const payData = paySnap.data() || {};
+        if (payData.email && payData.package) {
+          const q = db
+            .collection("pendingBusinesses")
+            .where("paymentPhone", "==", payData.phone)
+            .where("package", "==", payData.package);
+          const snap = await q.get();
+          if (!snap.empty) {
+            for (const doc of snap.docs) {
+              const businessData = doc.data();
+              const businessId = doc.id;
 
-            await db.collection("businesses").doc(businessId).set({
-              ...businessData,
-              status: "approved",
-              paymentStatus: "paid",
-              approvedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
+              await db.collection("businesses").doc(businessId).set(
+                {
+                  ...businessData,
+                  status: "approved",
+                  paymentStatus: "paid",
+                  approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              );
 
-            await db.collection("pendingBusinesses").doc(businessId).delete();
-            console.log(`✅ Business ${businessId} approved & moved`);
+              await db.collection("pendingBusinesses").doc(businessId).delete();
+              console.log(`✅ Business ${businessId} approved & moved`);
 
-            transporter.sendMail(
-              {
-                from: process.env.GMAIL_USER,
-                to: payData.email,
-                subject: "Your Business is Live on OBlinks!",
-                text: `Hello!\n\n✅ Your payment has been confirmed.\n✅ Your business "${businessData.title}" is now live on OBlinks.\n\n— OBlinks Team`,
-              },
-              (error, info) =>
-                error
-                  ? console.error("❌ Email send error:", error.message)
-                  : console.log("✅ Email sent:", info.response)
-            );
+              transporter.sendMail(
+                {
+                  from: process.env.GMAIL_USER,
+                  to: payData.email,
+                  subject: "Your Business is Live on OBlinks!",
+                  text: `Hello!\n\n✅ Your payment has been confirmed.\n✅ Your business "${businessData.title}" is now live on OBlinks.\n\n— OBlinks Team`,
+                },
+                (error, info) =>
+                  error
+                    ? console.error("❌ Email send error:", error.message)
+                    : console.log("✅ Email sent:", info.response)
+              );
+            }
           }
         }
+      } catch (err) {
+        console.error("❌ Business automation error:", err.message);
       }
-    } catch (err) {
-      console.error("❌ Business automation error:", err.message);
     }
 
     res.send("OK");
@@ -674,9 +824,13 @@ app.post(
     const { txRef } = req.body || {};
     if (!txRef) return res.status(400).json({ error: "txRef required" });
     // Silicon docs: /transaction_status/{reference}
-    const url = `https://silicon-pay.com/transaction_status/${encodeURIComponent(txRef)}`;
+    const url = `https://silicon-pay.com/transaction_status/${encodeURIComponent(
+      txRef
+    )}`;
     const payload = { encryption_key: process.env.ENCRYPTION_KEY };
-    const { data } = await axios.post(url, payload, { headers: { "Content-Type": "application/json" } });
+    const { data } = await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json" },
+    });
     res.json(data);
   })
 );
