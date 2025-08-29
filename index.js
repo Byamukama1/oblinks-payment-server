@@ -158,7 +158,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     {
       txRef,                 // convenience copy
       providerTxRef: txRef,  // used by /ipn to find this doc
-      status: "processing",
+      status: "PAID",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
