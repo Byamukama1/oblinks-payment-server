@@ -209,7 +209,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
 
     if (accepted) {
       await db.collection("withdraws").doc(withdrawalId).update({
-        status: "processing",
+        status: "PAID",
         providerRef: data?.txRef || txRef,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
