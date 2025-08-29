@@ -154,7 +154,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   const txRef = `TX-${Date.now()}`;
 
   // Save mapping BEFORE calling SiliconPay (so /ipn can find it)
-  await db.collection("withdrawals").doc(withdrawalId).set(
+  await db.collection("withdraws").doc(withdrawalId).set(
     {
       txRef,                 // convenience copy
       providerTxRef: txRef,  // used by /ipn to find this doc
