@@ -132,8 +132,7 @@ async function siliconToken() {
 }
 
 /* ── Withdraw (payout) ──
-   ALWAYS generate our own txRef (TX-<timestamp>) and save it to the doc,
-   so IPN can map back to this withdrawal. */
+   Prefer the txRef already on the doc; generate only if missing. */
 async function sendPayout(withdrawalId, withdrawal, token) {
   const encryptionKey = String(process.env.ENCRYPTION_KEY || "");
   const secretKey = String(process.env.SECRET_KEY || "");
@@ -150,8 +149,8 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     return;
   }
 
-  // Stable SiliconPay reference we control
-  const txRef = `TX-${Date.now()}`;
+  // Use existing txRef if present, else create one (backward compatible)
+  const txRef = withdrawal.txRef || `TX-${Date.now()}`;
 
   // Save mapping BEFORE calling SiliconPay (so /ipn can find it)
   await db.collection("withdraws").doc(withdrawalId).set(
@@ -171,7 +170,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   const payload = {
     req: "mm",
     currency: "UGX",
-    txRef, // ✅ the one we generated
+    txRef, // the one we control
     encryption_key: encryptionKey,
     amount: String(amountInt),
     emailAddress: withdrawal.emailAddress || "noreply@oblinks.app",
@@ -201,7 +200,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     const { data, status } = await axios.post(process.env.SILICON_PAY_URL, payload, { headers });
     console.log("✅ SiliconPay Withdraw Response:", status, data);
 
-    if (isSuccess(data?.status)) {
+    if (isSuccess(data?.status) || Number(data?.status) === 200) {
       await db.collection("withdraws").doc(withdrawalId).update({
         status: "approved",
         paidAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -244,6 +243,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
 /* ─────────────── MoneyGamez deposit helpers ─────────────── */
 const payCache = new Map(); // txRef -> { amount, contact, userId, narrative, createdAt }
 
+/* … (deposits & stakes unchanged) … */
 async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
   const depRef = db.collection("deposits").doc(txRef);
   const depSnap = await depRef.get();
@@ -339,7 +339,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
   console.log(`💰 Deposit processed: ${txRef} +${amount} UGX → stake created & totals updated`);
 }
 
-/* ─────────────── Daily returns ─────────────── */
+/* ─────────────── Daily returns (unchanged) ─────────────── */
 async function runDailyReturns() {
   const started = DateTime.now().setZone(TZ).toISO();
   console.log(`[CRON] Daily returns start @ ${started} (${TZ})`);
@@ -400,6 +400,7 @@ async function runDailyReturns() {
           };
           if (newRemaining <= 0) {
             updates.status = "completed";
+            updates.completedAt: admin.firestore.FieldValue.serverTimestamp(),
             updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
           }
           tx.update(stakeRef, updates);
@@ -425,7 +426,6 @@ async function runDailyReturns() {
   return { ok: true, date: today, processed, paidTotal: round2(paidTotal), rate: DAILY_RATE };
 }
 
-
 /* ─────────────── Basic routes ─────────────── */
 app.get("/", (_req, res) =>
   res
@@ -438,7 +438,73 @@ app.get("/", (_req, res) =>
 );
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-/* ─────────────── OBlinks: Withdraws ─────────────── */
+/* ─────────────── NEW: Create + process withdrawal (server owns txRef & doc) ─────────────── */
+app.post(
+  "/create-withdrawal",
+  asyncRoute(async (req, res) => {
+    const { userId, amount, phone, names, email } = req.body || {};
+    const amt = Number(amount);
+
+    if (!userId) return res.status(400).json({ success: false, error: "Missing userId" });
+    if (!Number.isFinite(amt) || amt < 2000)
+      return res.status(400).json({ success: false, error: "Minimum is UGX 2,000" });
+
+    // Airtel numbers only
+    let digits = String(phone || "").replace(/\D/g, "");
+    if (/^0\d{9}$/.test(digits)) digits = "256" + digits.slice(1);
+    if (!/^2567(0|4|5)\d{7}$/.test(digits))
+      return res.status(400).json({ success: false, error: "Airtel only (070/074/075). Use 07… or 2567…" });
+
+    const fee = round2(amt * 0.15);
+    const net = round2(amt - fee);
+
+    // Server-generated txRef (single source of truth)
+    const txRef = `TX-${Date.now()}-${Math.floor(Math.random() * 1e5)}`;
+
+    await db.runTransaction(async (tx) => {
+      const userRef = db.collection("users").doc(userId);
+      const uSnap = await tx.get(userRef);
+      if (!uSnap.exists) throw new Error("User not found");
+
+      const balance = Number(uSnap.data()?.accountBalance || 0);
+      if (balance < amt) throw new Error("Insufficient balance");
+
+      const wRef = db.collection("withdraws").doc(txRef);
+      tx.set(wRef, {
+        withdrawalId: txRef,
+        txRef,
+        providerTxRef: txRef, // IPN will match on this
+        userId,
+        phone: digits,
+        names: names || "",
+        emailAddress: email || "noreply@oblinks.app",
+        network: "Airtel",
+        amount: amt,
+        feePercent: 15,
+        userFee: fee,
+        userReceives: net,
+        status: "pending",
+        reason: "Customer payment withdraw",
+        currency: "UGX",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      tx.update(userRef, {
+        accountBalance: admin.firestore.FieldValue.increment(-amt),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    // Kick off payout immediately using the SAME txRef
+    const token = await siliconToken();
+    await sendPayout(txRef, { amount: amt, phone: digits, emailAddress: email, txRef }, token);
+
+    return res.json({ success: true, withdrawalId: txRef, txRef });
+  })
+);
+
+/* ─────────────── Legacy: Process pending/one-off (kept for compatibility) ─────────────── */
 app.get(
   "/process-withdraws",
   asyncRoute(async (_req, res) => {
@@ -523,7 +589,6 @@ app.post(
 );
 
 /* ─────────────── MoneyGamez: Deposit (Silicon Collect) ─────────────── */
-// Body: { amount, phone, userId, narrative?, email? }
 app.post(
   "/api/pay",
   asyncRoute(async (req, res) => {
