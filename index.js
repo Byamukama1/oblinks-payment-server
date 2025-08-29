@@ -143,7 +143,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
 
   if (!phone || !amountInt) {
     console.error("❌ Invalid withdrawal payload:", { phone, amount: withdrawal.amount });
-    await db.collection("withdrawals").doc(withdrawalId).update({
+    await db.collection("withdraws").doc(withdrawalId).update({
       status: "failed",
       errorMessage: "Invalid phone or amount",
     });
@@ -202,7 +202,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     console.log("✅ SiliconPay Withdraw Response:", status, data);
 
     if (isSuccess(data?.status)) {
-      await db.collection("withdrawals").doc(withdrawalId).update({
+      await db.collection("withdraws").doc(withdrawalId).update({
         status: "approved",
         paidAt: admin.firestore.FieldValue.serverTimestamp(),
         providerRef: data?.txRef || txRef,
@@ -224,7 +224,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
         );
       }
     } else {
-      await db.collection("withdrawals").doc(withdrawalId).update({
+      await db.collection("withdraws").doc(withdrawalId).update({
         status: "failed",
         errorMessage: data?.message || "Transfer rejected",
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -233,7 +233,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     }
   } catch (err) {
     console.error("❌ Withdraw error:", err.response?.data || err.message);
-    await db.collection("withdrawals").doc(withdrawalId).update({
+    await db.collection("withdraws").doc(withdrawalId).update({
       status: "failed",
       errorMessage: err.response?.data?.message || err.message,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -438,19 +438,19 @@ app.get("/", (_req, res) =>
 );
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-/* ─────────────── OBlinks: Withdrawals ─────────────── */
+/* ─────────────── OBlinks: Withdraws ─────────────── */
 app.get(
-  "/process-withdrawals",
+  "/process-withdraws",
   asyncRoute(async (_req, res) => {
-    console.log("✅ Checking pending withdrawals…");
-    const snap = await db.collection("withdrawals").where("status", "==", "pending").get();
-    if (snap.empty) return res.send("No pending withdrawals found.");
+    console.log("✅ Checking pending withdraws…");
+    const snap = await db.collection("withdraws").where("status", "==", "pending").get();
+    if (snap.empty) return res.send("No pending withdraws found.");
     const token = await siliconToken();
     for (const doc of snap.docs) {
       console.log(`➡️ Processing Withdrawal ${doc.id}`, doc.data());
       await sendPayout(doc.id, doc.data(), token);
     }
-    res.send("All withdrawals processed.");
+    res.send("All withdraws processed.");
   })
 );
 
@@ -460,7 +460,7 @@ app.post(
     const { withdrawalId } = req.body || {};
     if (!withdrawalId) return res.status(400).json({ success: false, error: "Missing withdrawalId" });
 
-    const ref = db.collection("withdrawals").doc(withdrawalId);
+    const ref = db.collection("withdraws").doc(withdrawalId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ success: false, error: "Withdrawal not found" });
 
@@ -582,7 +582,7 @@ app.get("/api/pay/:ref", (req, res) => {
   res.json({ success: true, data: [{ transaction_reference: ref, ...rec }] });
 });
 
-/* ─────────────── Unified IPN (OBlinks + MoneyGamez + Withdrawals) ─────────────── */
+/* ─────────────── Unified IPN (OBlinks + MoneyGamez + Withdraws) ─────────────── */
 app.post(
   "/ipn",
   asyncRoute(async (req, res) => {
@@ -614,10 +614,10 @@ app.post(
 
     // If this is a WITHDRAWAL IPN, find the doc by providerTxRef
     try {
-      const wSnap = await db.collection("withdrawals").where("providerTxRef", "==", txRef).limit(1).get();
+      const wSnap = await db.collection("withdraws").where("providerTxRef", "==", txRef).limit(1).get();
       if (!wSnap.empty) {
         const wDoc = wSnap.docs[0];
-        const wRef = db.collection("withdrawals").doc(wDoc.id);
+        const wRef = db.collection("withdraws").doc(wDoc.id);
         const finalStatus = isSuccess(status) ? "approved" : "failed";
         const now = admin.firestore.FieldValue.serverTimestamp();
 
