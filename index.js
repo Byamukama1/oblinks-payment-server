@@ -88,32 +88,6 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-/* ➕ Company metrics refs & helpers (NEW) */
-const metricsRef = db.collection("company").doc("metrics");
-
-async function ensureMetrics() {
-  // Safe to call anytime; creates doc if missing
-  await metricsRef.set(
-    {
-      totalCompanyStakes: 0,
-      totalCompanyTransfers: 0,
-      transferInProgress: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
-async function bumpCompanyStakes(delta) {
-  if (!(Number(delta) > 0)) return;
-  await ensureMetrics();
-  await metricsRef.update({
-    totalCompanyStakes: admin.firestore.FieldValue.increment(Number(delta)),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-}
-
 /* ─────────────── Utils ─────────────── */
 const asyncRoute =
   (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -157,7 +131,38 @@ async function siliconToken() {
   return data.token;
 }
 
-/* ── Withdraw (payout) ── */
+/* ─────────────── Company metrics increment helper ─────────────── */
+async function incrementCompanyStakes(delta) {
+  const ref = db.collection("company").doc("metrics");
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    if (!snap.exists) {
+      tx.set(
+        ref,
+        {
+          totalCompanyStakes: round2(Number(delta || 0)),
+          totalCompanyTransfers: 0,
+          transferInProgress: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+    } else {
+      const cur = Number(snap.data()?.totalCompanyStakes || 0);
+      tx.update(ref, {
+        totalCompanyStakes: round2(cur + Number(delta || 0)),
+        updatedAt: now,
+      });
+    }
+  });
+}
+
+/* ── Withdraw (payout) ──
+   ALWAYS generate our own txRef (TX-<timestamp>) and save it to the doc,
+   so IPN can map back to this withdrawal. */
 async function sendPayout(withdrawalId, withdrawal, token) {
   const encryptionKey = String(process.env.ENCRYPTION_KEY || "");
   const secretKey = String(process.env.SECRET_KEY || "");
@@ -174,25 +179,28 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     return;
   }
 
+  // Stable SiliconPay reference we control
   const txRef = `TX-${Date.now()}`;
 
+  // Save mapping BEFORE calling SiliconPay (so /ipn can find it)
   await db.collection("withdraws").doc(withdrawalId).set(
     {
-      txRef,
-      providerTxRef: txRef,
+      txRef,                 // convenience copy
+      providerTxRef: txRef,  // used by /ipn to find this doc
       status: "PAID",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
   );
 
+  // signature = HMAC_SHA256( SHA256(encryption_key)+phone , secret_key )
   const msg = crypto.createHash("sha256").update(encryptionKey).digest("hex") + phone;
   const signature = crypto.createHmac("sha256", secretKey).update(msg).digest("hex");
 
   const payload = {
     req: "mm",
     currency: "UGX",
-    txRef,
+    txRef, // ✅ the one we generated
     encryption_key: encryptionKey,
     amount: String(amountInt),
     emailAddress: withdrawal.emailAddress || "noreply@oblinks.app",
@@ -275,10 +283,6 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
 
   const stakeRef = db.collection("stakes").doc(txRef);
 
-  /* Track whether we created a NEW stake (so we only bump totals once) */
-  let createdStake = false;
-  let createdPrincipal = 0;
-
   await db.runTransaction(async (tx) => {
     const userRef = db.collection("users").doc(userId);
     const userSnap = await tx.get(userRef);
@@ -301,11 +305,10 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
 
     // writes
     if (!stakeSnap.exists) {
-      const principal = round2(amount);
       tx.set(stakeRef, {
         stakeId: txRef,
         userId,
-        principal,
+        principal: round2(amount),
         dailyRate: DAILY_RATE,
         totalDays: DURATION_DAYS,
         remainingDays: DURATION_DAYS,
@@ -316,8 +319,6 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
         lastProcessedDate: null,
         depositRef: txRef,
       });
-      createdStake = true;
-      createdPrincipal = principal; // remember for metrics bump
     }
 
     tx.update(userRef, {
@@ -353,16 +354,10 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     });
   });
 
-  /* ➕ NEW: bump company.totalCompanyStakes only when a new stake was created */
-  if (createdStake && createdPrincipal > 0) {
-    try {
-      await bumpCompanyStakes(createdPrincipal);
-    } catch (e) {
-      console.error("⚠️ Failed to bump totalCompanyStakes:", e.message);
-    }
-  }
+  // ✅ After successfully crediting and creating stake, increment company stakes total
+  await incrementCompanyStakes(amount);
 
-  console.log(`💰 Deposit processed: ${txRef} +${amount} UGX → stake ${createdStake ? "created" : "exists"} & totals updated`);
+  console.log(`💰 Deposit processed: ${txRef} +${amount} UGX → stake created & totals updated`);
 }
 
 
@@ -427,7 +422,7 @@ async function runDailyReturns() {
           };
           if (newRemaining <= 0) {
             updates.status = "completed";
-            updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
+            updates.completedAt = admin.firestore.FieldValue.serverTimestamp(); // ✅ fixed
           }
           tx.update(stakeRef, updates);
         });
@@ -624,6 +619,7 @@ app.post(
       return res.status(403).send("Invalid signature");
     }
 
+    // Save/merge generic payment record (used by collections)
     const paymentRef = db.collection("payments").doc(txRef);
     await paymentRef.set(
       {
@@ -637,6 +633,7 @@ app.post(
     );
     console.log(`✅ Payment ${txRef} -> ${status}`);
 
+    // If this is a WITHDRAWAL IPN, find the doc by providerTxRef
     try {
       const wSnap = await db.collection("withdraws").where("providerTxRef", "==", txRef).limit(1).get();
       if (!wSnap.empty) {
@@ -656,6 +653,7 @@ app.post(
           { merge: true }
         );
 
+        // Optional: light user update (if userId present)
         const wid = wDoc.data() || {};
         if (finalStatus === "approved" && wid.userId) {
           await db.collection("users").doc(wid.userId).set(
@@ -671,6 +669,7 @@ app.post(
       console.error("❌ Withdrawal IPN handling error:", e.message);
     }
 
+    // MoneyGamez credit + stake creation on success (collections flow)
     if (isSuccess(status)) {
       const rec = payCache.get(txRef) || {};
       let amount =
