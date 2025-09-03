@@ -291,6 +291,13 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
 
     const stakeSnap = await tx.get(stakeRef);
 
+    // 🔹 READ company metrics *inside this transaction* to decide the daily rate
+    const metricsRef = db.collection("company").doc("metrics");
+    const metricsSnap = await tx.get(metricsRef);
+    const totalStakes = Number(metricsSnap.data()?.totalCompanyStakes || 0);
+    const totalTransfers = Number(metricsSnap.data()?.totalCompanyTransfers || 0);
+    const chosenDailyRate = (totalStakes === totalTransfers) ? 0.12 : DAILY_RATE;
+
     // referrer (reads only)
     let refRef = null;
     let refData = null;
@@ -309,7 +316,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
         stakeId: txRef,
         userId,
         principal: round2(amount),
-        dailyRate: DAILY_RATE,
+        dailyRate: chosenDailyRate,                 // ← 12% if totals equal; else default DAILY_RATE (10%)
         totalDays: DURATION_DAYS,
         remainingDays: DURATION_DAYS,
         earnedSoFar: 0,
