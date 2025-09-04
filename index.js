@@ -66,6 +66,9 @@ const DAILY_RATE = 0.10;
 const DURATION_DAYS = 20;
 const REFERRAL_BONUS_RATE = 0.20;
 
+/* ✅ NEW: Deposit fee (10%) applied when creating the stake */
+const DEPOSIT_FEE_RATE = 0.10;
+
 /* ─────────────── Firebase Admin ─────────────── */
 function resolveServiceAccountPath() {
   if (process.env.FIREBASE_ADMIN_PATH) return process.env.FIREBASE_ADMIN_PATH;
@@ -267,10 +270,16 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
   const depSnap = await depRef.get();
   if (depSnap.exists && depSnap.data()?.credited) return;
 
+  /* ✅ Apply 10% deposit fee and compute net principal for the stake */
+  const depositFee = round2(Number(amount) * DEPOSIT_FEE_RATE);
+  const netPrincipal = round2(Number(amount) - depositFee);
+
   await depRef.set(
     {
       userId,
-      amount,
+      amount,                        // gross amount as received
+      depositFee,                    // recorded for transparency
+      netPrincipal,                  // recorded net that becomes stake principal
       phone: phone || null,
       gateway: "SiliconPay",
       status: "successful",
@@ -315,8 +324,8 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
       tx.set(stakeRef, {
         stakeId: txRef,
         userId,
-        principal: round2(amount),
-        dailyRate: chosenDailyRate,                 // ← 12% if totals equal; else default DAILY_RATE (10%)
+        principal: netPrincipal,            // ✅ stake principal uses NET after 10% fee
+        dailyRate: chosenDailyRate,         // ← 12% if totals equal; else default DAILY_RATE (10%)
         totalDays: DURATION_DAYS,
         remainingDays: DURATION_DAYS,
         earnedSoFar: 0,
@@ -329,14 +338,14 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     }
 
     tx.update(userRef, {
-      totalDeposited: round2(Number(u.totalDeposited || 0) + amount),
+      totalDeposited: round2(Number(u.totalDeposited || 0) + Number(amount)),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     if (refRef) {
       const paid = Array.isArray(refData.paidRefereesIds) ? refData.paidRefereesIds : [];
       if (!paid.includes(userId)) {
-        const bonus = round2(amount * REFERRAL_BONUS_RATE);
+        const bonus = round2(Number(amount) * REFERRAL_BONUS_RATE); // stays based on gross
         tx.update(refRef, {
           returnsWallet: admin.firestore.FieldValue.increment(bonus),
           paidRefereesIds: admin.firestore.FieldValue.arrayUnion(userId),
@@ -361,10 +370,12 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     });
   });
 
-  // ✅ After successfully crediting and creating stake, increment company stakes total
-  await incrementCompanyStakes(amount);
+  // ✅ After successfully crediting and creating stake, increment company stakes by NET principal
+  await incrementCompanyStakes(netPrincipal);
 
-  console.log(`💰 Deposit processed: ${txRef} +${amount} UGX → stake created & totals updated`);
+  console.log(
+    `💰 Deposit processed: ${txRef} gross=${amount} fee=${depositFee} net=${netPrincipal} → stake created & totals updated`
+  );
 }
 
 
