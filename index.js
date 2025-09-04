@@ -66,8 +66,9 @@ const DAILY_RATE = 0.10;
 const DURATION_DAYS = 20;
 const REFERRAL_BONUS_RATE = 0.20;
 
-/* ✅ NEW: Deposit fee (10%) applied when creating the stake */
-const DEPOSIT_FEE_RATE = 0.10;
+/* ✅ Fee config (for clarity) */
+const DEPOSIT_FEE_RATE = 0.10;          // 10% fee
+const FEE_DIVISOR = 1 + DEPOSIT_FEE_RATE; // 1.10
 
 /* ─────────────── Firebase Admin ─────────────── */
 function resolveServiceAccountPath() {
@@ -163,9 +164,7 @@ async function incrementCompanyStakes(delta) {
   });
 }
 
-/* ── Withdraw (payout) ──
-   ALWAYS generate our own txRef (TX-<timestamp>) and save it to the doc,
-   so IPN can map back to this withdrawal. */
+/* ── Withdraw (payout) ── */
 async function sendPayout(withdrawalId, withdrawal, token) {
   const encryptionKey = String(process.env.ENCRYPTION_KEY || "");
   const secretKey = String(process.env.SECRET_KEY || "");
@@ -182,28 +181,25 @@ async function sendPayout(withdrawalId, withdrawal, token) {
     return;
   }
 
-  // Stable SiliconPay reference we control
   const txRef = `TX-${Date.now()}`;
 
-  // Save mapping BEFORE calling SiliconPay (so /ipn can find it)
   await db.collection("withdraws").doc(withdrawalId).set(
     {
-      txRef,                 // convenience copy
-      providerTxRef: txRef,  // used by /ipn to find this doc
+      txRef,
+      providerTxRef: txRef,
       status: "PAID",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
   );
 
-  // signature = HMAC_SHA256( SHA256(encryption_key)+phone , secret_key )
   const msg = crypto.createHash("sha256").update(encryptionKey).digest("hex") + phone;
   const signature = crypto.createHmac("sha256", secretKey).update(msg).digest("hex");
 
   const payload = {
     req: "mm",
     currency: "UGX",
-    txRef, // ✅ the one we generated
+    txRef,
     encryption_key: encryptionKey,
     amount: String(amountInt),
     emailAddress: withdrawal.emailAddress || "noreply@oblinks.app",
@@ -270,16 +266,16 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
   const depSnap = await depRef.get();
   if (depSnap.exists && depSnap.data()?.credited) return;
 
-  /* ✅ Apply 10% deposit fee and compute net principal for the stake */
-  const depositFee = round2(Number(amount) * DEPOSIT_FEE_RATE);
-  const netPrincipal = round2(Number(amount) - depositFee);
+  // ✅ Reverse the 10% top-up to get the user’s intended base (principal)
+  const netPrincipal = round2(Number(amount) / FEE_DIVISOR); // e.g., 2200/1.1 = 2000
+  const depositFee  = round2(Number(amount) - netPrincipal); // e.g., 2200-2000 = 200
 
   await depRef.set(
     {
       userId,
-      amount,                        // gross amount as received
-      depositFee,                    // recorded for transparency
-      netPrincipal,                  // recorded net that becomes stake principal
+      amount,             // gross charged/approved on phone
+      depositFee,         // recorded for transparency
+      netPrincipal,       // actual stake principal
       phone: phone || null,
       gateway: "SiliconPay",
       status: "successful",
@@ -300,7 +296,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
 
     const stakeSnap = await tx.get(stakeRef);
 
-    // 🔹 READ company metrics *inside this transaction* to decide the daily rate
+    // 🔹 Decide daily rate based on company metrics (unchanged)
     const metricsRef = db.collection("company").doc("metrics");
     const metricsSnap = await tx.get(metricsRef);
     const totalStakes = Number(metricsSnap.data()?.totalCompanyStakes || 0);
@@ -324,8 +320,8 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
       tx.set(stakeRef, {
         stakeId: txRef,
         userId,
-        principal: netPrincipal,            // ✅ stake principal uses NET after 10% fee
-        dailyRate: chosenDailyRate,         // ← 12% if totals equal; else default DAILY_RATE (10%)
+        principal: netPrincipal,         // ✅ base after reversing the fee
+        dailyRate: chosenDailyRate,      // 12% if equal; else 10%
         totalDays: DURATION_DAYS,
         remainingDays: DURATION_DAYS,
         earnedSoFar: 0,
@@ -337,6 +333,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
       });
     }
 
+    // Keep totalDeposited behavior the same (adds gross amount)
     tx.update(userRef, {
       totalDeposited: round2(Number(u.totalDeposited || 0) + Number(amount)),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -345,7 +342,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     if (refRef) {
       const paid = Array.isArray(refData.paidRefereesIds) ? refData.paidRefereesIds : [];
       if (!paid.includes(userId)) {
-        const bonus = round2(Number(amount) * REFERRAL_BONUS_RATE); // stays based on gross
+        const bonus = round2(Number(amount) * REFERRAL_BONUS_RATE); // based on gross
         tx.update(refRef, {
           returnsWallet: admin.firestore.FieldValue.increment(bonus),
           paidRefereesIds: admin.firestore.FieldValue.arrayUnion(userId),
@@ -370,7 +367,7 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
     });
   });
 
-  // ✅ After successfully crediting and creating stake, increment company stakes by NET principal
+  // ✅ Company stakes increment uses the actual principal (not gross)
   await incrementCompanyStakes(netPrincipal);
 
   console.log(
@@ -440,7 +437,7 @@ async function runDailyReturns() {
           };
           if (newRemaining <= 0) {
             updates.status = "completed";
-            updates.completedAt = admin.firestore.FieldValue.serverTimestamp(); // ✅ fixed
+            updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
           }
           tx.update(stakeRef, updates);
         });
@@ -637,7 +634,6 @@ app.post(
       return res.status(403).send("Invalid signature");
     }
 
-    // Save/merge generic payment record (used by collections)
     const paymentRef = db.collection("payments").doc(txRef);
     await paymentRef.set(
       {
@@ -651,7 +647,6 @@ app.post(
     );
     console.log(`✅ Payment ${txRef} -> ${status}`);
 
-    // If this is a WITHDRAWAL IPN, find the doc by providerTxRef
     try {
       const wSnap = await db.collection("withdraws").where("providerTxRef", "==", txRef).limit(1).get();
       if (!wSnap.empty) {
@@ -671,7 +666,6 @@ app.post(
           { merge: true }
         );
 
-        // Optional: light user update (if userId present)
         const wid = wDoc.data() || {};
         if (finalStatus === "approved" && wid.userId) {
           await db.collection("users").doc(wid.userId).set(
@@ -687,7 +681,6 @@ app.post(
       console.error("❌ Withdrawal IPN handling error:", e.message);
     }
 
-    // MoneyGamez credit + stake creation on success (collections flow)
     if (isSuccess(status)) {
       const rec = payCache.get(txRef) || {};
       let amount =
