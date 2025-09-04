@@ -173,7 +173,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   if (!phone || !amountInt) {
     console.error("❌ Invalid withdrawal payload:", { phone, amount: withdrawal.amount });
     await db.collection("withdraws").doc(withdrawalId).update({
-      status: "failed",
+      status: "pending",
       errorMessage: "Invalid phone or amount",
     });
     return;
@@ -243,7 +243,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
       });
     } else {
       await db.collection("withdraws").doc(withdrawalId).update({
-        status: "failed",
+        status: "pending",
         errorMessage: data?.message || "Transfer rejected",
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -252,7 +252,7 @@ async function sendPayout(withdrawalId, withdrawal, token) {
   } catch (err) {
     console.error("❌ Withdraw error:", err.response?.data || err.message);
     await db.collection("withdraws").doc(withdrawalId).update({
-      status: "failed",
+      status: "pending",
       errorMessage: err.response?.data?.message || err.message,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -646,7 +646,7 @@ app.post(
       if (!wSnap.empty) {
         const wDoc = wSnap.docs[0];
         const wRef = db.collection("withdraws").doc(wDoc.id);
-        const finalStatus = isSuccess(status) ? "approved" : "failed";
+        const finalStatus = isSuccess(status) ? "approved" : "pending";
         const now = admin.firestore.FieldValue.serverTimestamp();
 
         await wRef.set(
