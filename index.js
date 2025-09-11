@@ -443,7 +443,7 @@ async function runDailyReturns() {
           };
           if (newRemaining <= 0) {
             updates.status = "completed";
-            updates.completedAt: admin.firestore.FieldValue.serverTimestamp();
+            updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
           }
           tx.update(stakeRef, updates);
         });
@@ -467,6 +467,7 @@ async function runDailyReturns() {
 
   return { ok: true, date: today, processed, paidTotal: round2(paidTotal), rate: DAILY_RATE };
 }
+
 
 /* ─────────────── Basic routes ─────────────── */
 app.get("/", (_req, res) =>
