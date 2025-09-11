@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const nodemailer = require("nodemailer");
 const admin = require("firebase-admin");
+const distributor = require("./distributor"); // ✅ ADDED
 
 const app = express();
 
@@ -370,6 +371,11 @@ async function createStakeAndCredit(txRef, amount, userId, phone, rawEvent) {
   // ✅ Company stakes increment uses the actual principal (not gross)
   await incrementCompanyStakes(netPrincipal);
 
+  // 🔔 Call distributor to handle referral movement & equal distribution (non-blocking)
+  distributor.runForStake(txRef).catch((e) =>
+    console.error("distributor.runForStake error:", e)
+  );
+
   console.log(
     `💰 Deposit processed: ${txRef} gross=${amount} fee=${depositFee} net=${netPrincipal} → stake created & totals updated`
   );
@@ -437,7 +443,7 @@ async function runDailyReturns() {
           };
           if (newRemaining <= 0) {
             updates.status = "completed";
-            updates.completedAt = admin.firestore.FieldValue.serverTimestamp();
+            updates.completedAt: admin.firestore.FieldValue.serverTimestamp();
           }
           tx.update(stakeRef, updates);
         });
