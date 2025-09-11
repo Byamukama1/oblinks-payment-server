@@ -1,28 +1,27 @@
 // distributor.js
 // Works with your current index.js (Render server).
 // Moves money ONLY from users.returnsWallet -> users.accountBalance.
-// Order: (1) Referral bonus (from referrer)  (2) Equal distribution of the remaining principal to all active-stake users.
+// Order: (1) Referral bonus (from referrer)  (2) WEIGHTED distribution of the remaining pool
+// Weight = user's total active principal / total active principal of all users.
 
 const admin = require("firebase-admin");
 
 const STAKES_COL      = "stakes";
 const USERS_COL       = "users";
 const TRANSFERS_COL   = "transfers";
-const REFERRALS_COL   = "referrals"; // index.js writes a log here on first stake { referrerId, refereeId, depositRef, bonus, ... }
+const REFERRALS_COL   = "referrals"; // index.js logs first-stake referrals here
 const COMPANY_METRICS = ["company", "metrics"]; // collection/doc
 const JOBS_COL        = "distributionJobs";
 
-const PAGE_SIZE = 200; // user slice size when distributing
+const PAGE_SIZE = 200; // how many users to update per batch
 
 function db() { return admin.firestore(); }
 const now = () => admin.firestore.FieldValue.serverTimestamp();
+const round0 = (n)=> Math.round(Number(n)||0);
 
-function round0(n){ return Math.round(Number(n)||0); }
-
-/** Public API — optional background listener */
+/** Optional background listener (not required when you call runForStake from index.js) */
 function start(){
-  const _db = db();
-  _db.collection(STAKES_COL)
+  db().collection(STAKES_COL)
     .where("status","==","active")
     .where("distributionProcessed","==", false)
     .onSnapshot(async (snap)=>{
@@ -30,9 +29,8 @@ function start(){
         if (ch.type !== "added") continue;
         const s = ch.doc.data() || {};
         const id = ch.doc.id;
-        try{
-          await handleStake(id, s);
-        }catch(e){ console.error("[distributor] listener failed", id, e); }
+        try{ await handleStake(id, s); }
+        catch(e){ console.error("[distributor] listener failed", id, e); }
       }
     }, (err)=> console.error("[distributor] listener error:", err));
   console.log("[distributor] listening for undistributed active stakes…");
@@ -63,36 +61,43 @@ async function handleStake(stakeId, stakeDoc){
   }).catch((e)=>{ throw e; });
 
   try{
-    // Basic stake sanity
-    const principal = Number(stakeDoc.principal || 0); // index.js wrote netPrincipal here
+    // Basic stake sanity — index.js writes netPrincipal into "principal"
+    const principal = Number(stakeDoc.principal || 0);
     if (!(principal > 0)){
       await finishJob(jobRef, stakeId, "invalid-principal", 0, 0);
       return;
     }
 
-    // 1) Try to move referral bonus for this stake if index.js created one
+    // 1) Referral first (if any)
     const { referrerId, bonus } = await getReferralForStake(stakeId);
     const referralMoved = (referrerId && bonus>0)
       ? await moveReferralBonus(referrerId, stakeId, bonus)
       : 0;
 
-    // 2) Distribute remaining principal equally to all active-stake users
+    // 2) Weighted distribution over remaining pool
     const pool = Math.max(0, principal - referralMoved);
     let distributed = 0;
     let totalUsers  = 0;
+    let totalActivePrincipal = 0;
 
     if (pool > 0){
-      const userIds = await listAllUsersWithActiveStake();
-      totalUsers = userIds.length;
-      if (totalUsers > 0){
-        const portion = pool / totalUsers;
-        for (let i=0; i<userIds.length; i+=PAGE_SIZE){
-          const slice = userIds.slice(i, i+PAGE_SIZE);
-          const part  = await distributeSlice(slice, portion, stakeId);
+      // Build a map: userId -> sum of their active principals
+      const { perUserPrincipal, totalPrincipal } = await buildActivePrincipalMap();
+      totalUsers = Object.keys(perUserPrincipal).length;
+      totalActivePrincipal = totalPrincipal;
+
+      if (totalUsers > 0 && totalActivePrincipal > 0){
+        // Stream users in deterministic chunks
+        const entries = Object.entries(perUserPrincipal); // [ [uid, userPrincipal], ... ]
+        for (let i=0; i<entries.length; i+=PAGE_SIZE){
+          const slice = entries.slice(i, i+PAGE_SIZE);
+          const part  = await distributeSliceWeighted(slice, pool, totalActivePrincipal, stakeId);
           distributed += part;
+
           await jobRef.set({
             cursor: i + slice.length,
             totalUsers,
+            totalActivePrincipal: round0(totalActivePrincipal),
             totalDistributed: round0(distributed),
             heartbeat: now(),
           }, { merge:true });
@@ -118,7 +123,7 @@ async function handleStake(stakeId, stakeDoc){
       jobRef.set({ done:true, locked:false, completedAt:now() }, { merge:true })
     ]);
 
-    console.log(`[distributor] stake=${stakeId} principal=${round0(principal)} referral=${round0(referralMoved)} distributed=${round0(distributed)}`);
+    console.log(`[distributor] stake=${stakeId} principal=${round0(principal)} referral=${round0(referralMoved)} weighted-distributed=${round0(distributed)} users=${totalUsers} TAP=${round0(totalActivePrincipal)}`);
   }catch(e){
     console.error("[distributor] failed for stake", stakeId, e.message);
     // unlock so it can retry later
@@ -196,12 +201,18 @@ async function moveReferralBonus(referrerId, stakeId, bonus){
   return moved;
 }
 
-/* --------------- Distribution helpers --------------- */
+/* --------------- Weighted distribution helpers --------------- */
 
-// All unique userIds having at least one active stake
-async function listAllUsersWithActiveStake(){
+/**
+ * Build a map of userId -> sum(principal) for all ACTIVE stakes.
+ * Returns { perUserPrincipal: { [uid]: number }, totalPrincipal: number }
+ */
+async function buildActivePrincipalMap(){
   const _db = db();
-  const ids = new Set();
+  const perUser = new Map(); // uid -> principal sum
+  let total = 0;
+
+  // We only require one composite index: status + stakeId (you already created it).
   const base = _db.collection(STAKES_COL).where("status","==","active");
   let last = null;
 
@@ -210,34 +221,59 @@ async function listAllUsersWithActiveStake(){
     if (last) q = q.startAfter(last);
     const snap = await q.get();
     if (snap.empty) break;
-    snap.forEach(d => { const uid = d.data()?.userId; if (uid) ids.add(uid); });
+
+    snap.forEach(doc=>{
+      const d = doc.data() || {};
+      const uid = d.userId;
+      const p   = Number(d.principal || 0);
+      if (!uid || !(p>0)) return;
+      perUser.set(uid, (perUser.get(uid)||0) + p);
+      total += p;
+    });
+
     last = snap.docs[snap.docs.length - 1];
     if (snap.size < 1000) break;
   }
-  return Array.from(ids);
+
+  // convert Map -> plain object for easier slicing
+  const obj = Object.fromEntries(perUser.entries());
+  return { perUserPrincipal: obj, totalPrincipal: total };
 }
 
-// For a slice of users, move min(portion, returnsWallet) into accountBalance and log one transfer each.
-async function distributeSlice(userIds, portion, stakeId){
+/**
+ * Weighted distribution for a slice of users.
+ * @param {[string, number][]} slice - entries of [uid, userPrincipal]
+ * @param {number} pool - remaining pool for this stake after referral
+ * @param {number} totalActivePrincipal - sum of all userPrincipals
+ * @param {string} stakeId
+ * @returns number actually moved in this slice
+ */
+async function distributeSliceWeighted(slice, pool, totalActivePrincipal, stakeId){
   const _db = db();
-  let distributed = 0;
+  let moved = 0;
+  if (!slice.length || totalActivePrincipal <= 0 || pool <= 0) return 0;
 
-  if (!userIds.length) return 0;
-
-  const refs = userIds.map(id => _db.collection(USERS_COL).doc(id));
+  // Fetch all users in this slice
+  const refs = slice.map(([uid]) => _db.collection(USERS_COL).doc(uid));
   const snaps = await _db.getAll(...refs);
 
   const batch = _db.batch();
+
   for (const snap of snaps){
     if (!snap.exists) continue;
-    const u = snap.data() || {};
+    const u   = snap.data() || {};
     const uid = snap.id;
 
-    const avail = Number(u.returnsWallet || 0);
-    const take  = Math.min(avail, portion);
+    const userPrincipal = Number((slice.find(([id])=>id===uid) || [null,0])[1] || 0);
+    if (!(userPrincipal > 0)) continue;
+
+    const target = pool * (userPrincipal / totalActivePrincipal); // proportional share
+    const avail  = Number(u.returnsWallet || 0);
+    const take   = Math.min(avail, target);
+
     if (take <= 0) continue;
 
-    distributed += take;
+    moved += take;
 
     batch.update(snap.ref, {
       accountBalance: Number(u.accountBalance || 0) + take,
@@ -252,13 +288,15 @@ async function distributeSlice(userIds, portion, stakeId){
       userId: uid,
       phone: u.phone || "",
       type: "transfer",
-      reason: `Auto distribution from stake ${stakeId}`,
+      reason: `Weighted distribution from stake ${stakeId}`,
       source: "auto-distributor",
       createdAt: now(),
     }, { merge:true });
   }
+
   await batch.commit();
-  return distributed;
+  return moved;
 }
 
 module.exports = { start, runForStake };
+```0
