@@ -299,4 +299,3 @@ async function distributeSliceWeighted(slice, pool, totalActivePrincipal, stakeI
 }
 
 module.exports = { start, runForStake };
-```0
